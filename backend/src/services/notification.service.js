@@ -1,0 +1,33 @@
+const nodemailer = require("nodemailer");
+const mongoose = require("mongoose");
+const Notification = require("../models/notification.model");
+const { sendWebhook } = require("./webhook.service");
+
+const SEVERITY_ORDER = { LOW: 1, MEDIUM: 2, HIGH: 3, CRITICAL: 4 };
+const enabled = (name) => process.env[`NOTIFICATION_${name}_ENABLED`] === "true";
+const shouldNotifyIncident = (incident) => SEVERITY_ORDER[incident.severity] >= (SEVERITY_ORDER[process.env.NOTIFICATION_MIN_SEVERITY || "HIGH"] || 3);
+const buildPayload = (incident) => ({ source: "LogIQ", event: incident.severity === "CRITICAL" ? "CRITICAL_INCIDENT" : "INCIDENT_CREATED", incidentId: incident._id.toString(), type: incident.type, severity: incident.severity, anomalyScore: incident.latestAnomalyScore, sourceService: incident.source, ip: incident.ip, endpoint: incident.endpoint, timestamp: incident.lastDetectedAt, aiAnalysis: { classification: incident.aiAnalysis.classification, riskLevel: incident.aiAnalysis.riskLevel, confidence: incident.aiAnalysis.confidence } });
+const buildMessage = (incident) => `[LogIQ] ${incident.severity} ${incident.type}\nIncident: ${incident._id}\nScore: ${incident.latestAnomalyScore}\nSource: ${incident.source || "Unknown"}\nIP: ${incident.ip || "Unknown"}\nEndpoint: ${incident.endpoint || "Unknown"}\nReasons: ${incident.anomalyReasons.join("; ")}\nAI: ${incident.aiAnalysis.explanation || "Unknown / insufficient evidence"}`;
+const getChannels = () => [["EMAIL", "ALERT_EMAIL_TO"], ["WEBHOOK", "WEBHOOK_URL"], ["TELEGRAM", "TELEGRAM_CHAT_ID"], ["DISCORD", "DISCORD_WEBHOOK_URL"]].filter(([channel, recipient]) => enabled(channel) && process.env[recipient]).map(([channel, recipient]) => ({ channel, recipient: process.env[recipient] }));
+const createNotification = async (incident, channel, recipient) => {
+    const type = incident.severity === "CRITICAL" ? "CRITICAL_INCIDENT" : "INCIDENT_CREATED";
+    const data = { incidentId: incident._id, type, channel, recipient, subject: `[LogIQ] ${incident.severity} Security Incident Detected`, message: buildMessage(incident), payload: buildPayload(incident), maxAttempts: Number(process.env.NOTIFICATION_MAX_RETRIES) || 3 };
+    try { return await Notification.create(data); } catch (error) { if (error.code === 11000) return null; throw error; }
+};
+const sendEmailNotification = async (notification) => {
+    if (!process.env.SMTP_HOST || !process.env.ALERT_EMAIL_FROM) throw Object.assign(new Error("Email delivery is not configured"), { retryable: false });
+    const transport = nodemailer.createTransport({ host: process.env.SMTP_HOST, port: Number(process.env.SMTP_PORT) || 587, secure: process.env.SMTP_SECURE === "true", auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD } : undefined, connectionTimeout: 10000 });
+    await transport.sendMail({ from: process.env.ALERT_EMAIL_FROM, to: notification.recipient, subject: notification.subject, text: notification.message });
+};
+const sendTelegramNotification = async (notification) => { const url = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`; const res = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: notification.recipient, text: notification.message }), signal: AbortSignal.timeout(10000) }); if (!res.ok) throw Object.assign(new Error("Telegram delivery failed"), { retryable: res.status >= 500 }); };
+const sendDiscordNotification = (notification) => sendWebhook(process.env.DISCORD_WEBHOOK_URL, { content: notification.message });
+const sendNotification = async (notification) => {
+    notification.status = "PROCESSING"; notification.attempts += 1; notification.lastAttemptAt = new Date(); await notification.save(); console.log(`Notification processing: ${notification._id}`);
+    try { if (notification.channel === "EMAIL") await sendEmailNotification(notification); else if (notification.channel === "WEBHOOK") await sendWebhook(process.env.WEBHOOK_URL, notification.payload); else if (notification.channel === "TELEGRAM") await sendTelegramNotification(notification); else await sendDiscordNotification(notification); notification.status = "SENT"; notification.sentAt = new Date(); notification.error = null; await notification.save(); console.log(`Notification sent: ${notification._id}`); return notification; }
+    catch (error) { const retry = error.retryable !== false && notification.attempts < notification.maxAttempts; notification.status = retry ? "RETRYING" : "FAILED"; notification.error = "Notification delivery failed"; if (!retry) notification.failedAt = new Date(); await notification.save(); console.error(`Notification ${notification.status.toLowerCase()}: ${notification._id}`); if (retry) setTimeout(() => sendNotification(notification), Math.min(30000, 1000 * 2 ** notification.attempts)); return notification; }
+};
+const scheduleIncidentNotifications = async (incident) => { if (!shouldNotifyIncident(incident)) return []; const notifications = await Promise.all((await Promise.resolve(getChannels())).map(async ({ channel, recipient }) => { const notification = await createNotification(incident, channel, recipient); if (notification) setImmediate(() => sendNotification(notification)); return notification; })); return notifications.filter(Boolean); };
+const retryNotification = async (id) => { if (!mongoose.isValidObjectId(id)) return null; const notification = await Notification.findById(id); if (!notification) return null; if (notification.status === "SENT") throw Object.assign(new Error("Sent notifications cannot be retried"), { status: 400 }); notification.status = "PENDING"; notification.error = null; await notification.save(); setImmediate(() => sendNotification(notification)); return notification; };
+const getNotificationStatus = (id) => mongoose.isValidObjectId(id) ? Notification.findById(id) : null;
+const getNotifications = async ({ status, channel, incidentId, page, limit }) => { const filter = {}; if (status) filter.status = status; if (channel) filter.channel = channel; if (incidentId) filter.incidentId = incidentId; const total = await Notification.countDocuments(filter); const data = await Notification.find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit); return { total, data }; };
+module.exports = { shouldNotifyIncident, createNotification, sendNotification, sendEmailNotification, sendWebhookNotification: sendWebhook, sendTelegramNotification, sendDiscordNotification, retryNotification, getNotificationStatus, getNotifications, scheduleIncidentNotifications };
